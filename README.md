@@ -130,6 +130,12 @@ sofatui stop [host]                 # stop background streams
 There is one stream per device; starting another replaces it. The stream ends when the
 machine sleeps or shuts down.
 
+## Releasing
+
+Bump the version with `uv version --bump patch` (or `minor`, `major`), commit, and
+publish a GitHub release tagged `v<version>`. The Publish workflow builds the package
+and uploads it to PyPI; it stops if the tag and the version differ.
+
 ## Known issues
 
 - **pyatv is patched at startup.** pyatv 0.18.0 does not yet handle AirPlay passwords

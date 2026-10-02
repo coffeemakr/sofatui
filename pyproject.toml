@@ -1,6 +1,6 @@
 [project]
 name = "sofatui"
-dynamic = ["version"]
+version = "0.1.0"
 description = "A terminal remote control for the Apple TV that can also stream local files"
 readme = "README.md"
 license = "MIT"
@@ -28,9 +28,6 @@ sofatui = "sofatui.app:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.version]
-path = "src/sofatui/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sofatui"]
