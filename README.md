@@ -1,7 +1,7 @@
 # sofatui
 
-A terminal remote control for the Apple TV. Press keys or click buttons to navigate,
-and stream local video files to the TV from a `/` command prompt with tab completion.
+A terminal remote control for the Apple TV that can also stream local files and web
+videos to it.
 
 ```
 ╭────────────────────────────────────────────────╮
@@ -9,7 +9,7 @@ and stream local video files to the TV from a `/` command prompt with tab comple
 │   Apple TV 4K (gen 3) · tvOS 27.0 build 24J361 │
 ├────────────────────────────────────────────────┤
 │ ▶ PLAYING                              AirPlay │
-│ Untitled media                                 │
+│ movie.mp4                                      │
 │                                                │
 │ ━━━━━───────────────────────────  5:36 / 38:33 │
 ├────────────────────────────────────────────────┤
@@ -27,163 +27,75 @@ and stream local video files to the TV from a `/` command prompt with tab comple
 │        │ « SKIP │ │ POWER  │ │ SKIP » │        │
 │        ╰────────╯ ╰────────╯ ╰────────╯        │
 ├────────────────────────────────────────────────┤
-│ › sent up                                      │
+│ › stream: playing                  ⇡ movie.mp4 │
 ╰────────────────────────────────────────────────╯
 ```
 
-The layout shrinks with the terminal: boxed remote, compact card, or three status
-lines.
+## Usage
 
-## Run
-
-With [uv](https://docs.astral.sh/uv/), no installation needed:
+With [uv](https://docs.astral.sh/uv/), nothing to install:
 
 ```sh
-uvx sofatui                  # find the Apple TV on the network
-uvx sofatui 192.168.1.100    # or give its address
+uvx sofatui                    # find the Apple TV and open the remote
+uvx sofatui 192.168.1.100      # or give its address
+uvx sofatui stream movie.mp4   # play a file without the remote (-d: in the background)
+uvx sofatui stop               # stop a background stream
 ```
 
-Or install it as a command with `uv tool install sofatui` (or `pipx install sofatui`)
-and run `sofatui`.
+To keep it as a command: `uv tool install sofatui` or `pipx install sofatui`. Linux and
+macOS.
 
-The latest development version runs straight from GitHub, or from a checkout:
-
-```sh
-uvx --from git+https://github.com/coffeemakr/sofatui sofatui
-uv run sofatui [host]        # in the repository
-```
-
-Without a host, sofatui scans the network and connects if it finds exactly one device.
-`$ATV_HOST` sets a default address. Linux and macOS only.
-
-## Setup
-
-sofatui uses [pyatv](https://pyatv.dev) and its stored credentials (`~/.pyatv.conf`).
-Pair once over AirPlay, which also enables the remote control buttons:
-
-```sh
-uvx --from pyatv atvremote -s <address> --protocol airplay pair
-```
-
-If the Apple TV has an AirPlay password (Settings → AirPlay and HomeKit), enter that
-password when asked for the PIN. sofatui notices that the device wants a password and
-asks for it, offering to save it for next time. To skip the question, provide it in
-one of these ways:
-
-- `--password <password>`
-- the `AIRPLAY_PASSWORD` environment variable
-- the file `~/.config/sofatui/password`, or `.airplay-password` in the current directory
+The first start pairs with the Apple TV: enter the PINs it shows. If the Apple TV has
+an AirPlay password, that password is asked for instead. `sofatui pair` does the same
+on its own.
 
 ## Keys
 
-| Key         | Action                  |
-|-------------|-------------------------|
-| Arrow keys  | Move                    |
-| Enter       | OK / select             |
-| Esc         | Back (menu)             |
-| `h`         | Home                    |
-| Space       | Play / pause            |
-| `[` and `]` | Skip back / forward     |
-| `+` and `-` | Volume up / down        |
-| `m`         | Mute                    |
-| `P`         | Power on / off          |
-| `/`         | Open the command prompt |
-| `q`, Ctrl+C | Quit                    |
+| Key         | Action                      |
+|-------------|-----------------------------|
+| Arrow keys  | Move                        |
+| Enter       | OK                          |
+| Esc         | Back                        |
+| `h`         | Home                        |
+| Space       | Play / pause                |
+| `[` `]`     | Skip back / forward         |
+| `O` `H` `B` | Long press OK / Home / Back |
+| `+` `-` `m` | Volume up / down, mute      |
+| `P`         | Power on / off              |
+| `/`         | Command prompt              |
+| `q`         | Quit                        |
 
-The volume keys only work while the Apple TV reports that it controls
-the volume of your TV or receiver. That needs HDMI-CEC (Settings → Remotes and Devices
-→ Volume Control → Auto); with volume control over infrared, only the physical remote
-can change the volume.
-
-Buttons can also be clicked. Because the mouse is captured, select text with
-Shift+drag.
+The buttons can be clicked too; turning off by mouse takes a click on POWER held for a
+second. Volume and mute need the Apple TV to control your TV's volume over HDMI-CEC.
 
 ## Commands
 
-| Command                 | Does                                                        |
-|-------------------------|-------------------------------------------------------------|
-| `/stream <file or URL>` | Play a local file or a web video, in the background         |
-| `/stop`                 | Stop the background stream                                  |
-| `/info`                 | Show details about the Apple TV and this session            |
-| `/help`                 | List the commands                                           |
-| `/quit`                 | Leave sofatui                                               |
+Press `/`, then Tab to complete commands and file names.
 
-In the prompt, Tab (or ↓) completes commands and file paths and then steps through the
-matches, Shift+Tab (or ↑) steps backwards, and Esc closes it. Suggestions can be
-clicked.
+| Command                 | Does                                             |
+|-------------------------|--------------------------------------------------|
+| `/stream <file or URL>` | Play a local file or the video of a web page     |
+| `/stop`                 | Stop the stream                                  |
+| `/info`                 | Show details about the Apple TV and this session |
+| `/help`                 | List the commands                                |
+| `/quit`                 | Leave sofatui                                    |
 
-The Apple TV must be able to play the format; only H.264/AAC `.mp4` has been tested.
+A stream runs in the background and keeps playing after you quit; `/stop` or
+`sofatui stop` ends it.
 
-## Background streams
+Web pages are played through [yt-dlp](https://github.com/yt-dlp/yt-dlp): the `yt-dlp`
+command if you have it, otherwise install with `uvx --from "sofatui[yt]" sofatui`. If a
+site does not load, route it through your machine with `/stream --via relay <URL>`, or
+fetch it first with `--via download`.
 
-The Apple TV pulls the file from your machine and stops as soon as the AirPlay session
-that started it closes, so a process has to stay alive while it plays. `/stream` starts
-that process detached: you can quit sofatui or close the terminal and the video keeps
-playing. A remote started later shows the running stream (`⇡ file`) and can `/stop` it.
+## Notes
 
-The same is available without the remote:
-
-```sh
-sofatui stream film.mp4 [host]      # play and wait until it ends (Ctrl+C stops)
-sofatui stream -d film.mp4 [host]   # play in the background and return
-sofatui stop [host]                 # stop background streams
-```
-
-There is one stream per device; starting another replaces it. The stream ends when the
-machine sleeps or shuts down.
-
-## Web videos
-
-`/stream <URL>` (or `sofatui stream <URL>`) plays the video of a web page, found with
-[yt-dlp](https://github.com/yt-dlp/yt-dlp). yt-dlp is optional: sofatui uses the
-`yt-dlp` command if it is installed, with your own configuration and cookies, and
-otherwise the module that comes with the `yt` extra:
-
-```sh
-uvx --from "sofatui[yt]" sofatui
-```
-
-How the video reaches the Apple TV is chosen automatically, or with `--via`:
-
-| Route      | What happens                                                              |
-|------------|---------------------------------------------------------------------------|
-| `direct`   | The Apple TV loads the video from the site itself                         |
-| `relay`    | All traffic goes through sofatui, with the headers the site expects       |
-| `download` | The whole video is downloaded first, then streamed like a local file      |
-
-- **direct** is used when the site offers an HLS playlist or one file with video and
-  audio. For HLS the Apple TV asks sofatui to fetch the playlist; it loads the rest
-  itself.
-- **relay** is used when yt-dlp reports headers the site checks on every request: a
-  referrer, cookies, or the address yt-dlp sends to get around a region check. The
-  Apple TV would send none of them. The video then flows through your machine for as
-  long as it plays.
-- **download** is used when video and audio only come separately (the better qualities
-  on YouTube). It needs `ffmpeg`; downloads are kept in `~/.cache/sofatui`.
-
-```sh
-sofatui stream --via relay <URL>     # also: /stream --via relay <URL> in the remote
-```
-
-If a stream fails with "the Apple TV could not load the video", try the next route.
-If yt-dlp cannot open a page, sofatui cannot either: sites that ask for a login or a
-bot check need the cookies set up in yt-dlp's own configuration.
-
-## Releasing
-
-Bump the version with `uv version --bump patch` (or `minor`, `major`), commit, and
-publish a GitHub release tagged `v<version>`. The Publish workflow builds the package
-and uploads it to PyPI; it stops if the tag and the version differ.
-
-## Known issues
-
-- **pyatv is patched at startup.** pyatv 0.18.0 does not yet handle AirPlay passwords
-  on AirPlay 2, the way current tvOS starts URL playback, or the mute key, so sofatui
-  patches these in when it starts (`src/sofatui/pyatv_patches.py`, based on
-  [pyatv#2846](https://github.com/postlund/pyatv/pull/2846)). The pyatv version is
-  pinned for that reason, and the patches should go away once pyatv supports this
-  itself.
-- **Tested on one device only:** an Apple TV 4K (3rd generation) on tvOS 27.
+- sofatui patches [pyatv](https://pyatv.dev) 0.18.0 at startup for things it does not
+  handle yet on current tvOS (`src/sofatui/pyatv_patches.py`), so that version is pinned.
+- Tested on one device: an Apple TV 4K (3rd generation) on tvOS 27, with H.264/AAC
+  `.mp4` files.
+- To release: `uv version --bump patch`, commit, and publish a GitHub release tagged
+  `v<version>`.
 
 ## Thanks
 

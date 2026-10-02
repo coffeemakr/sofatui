@@ -25,7 +25,15 @@ from pwinput import pwinput
 import pyatv
 from pyatv import exceptions
 from pyatv.support.net import get_local_address_reaching
-from pyatv.const import DeviceState, FeatureName, FeatureState, PowerState, Protocol
+from pyatv.const import (
+    DeviceState,
+    FeatureName,
+    FeatureState,
+    InputAction,
+    PairingRequirement,
+    PowerState,
+    Protocol,
+)
 from pyatv.interface import DeviceListener, PowerListener, PushListener
 from pyatv.storage.file_storage import FileStorage
 
@@ -119,11 +127,37 @@ BUTTONS = {
         lambda r: r.atv.remote_control.skip_forward(),
     ),
     "power": ("POWER", None, lambda r: r.toggle_power()),
+    # Long presses have keys of their own: a terminal does not report how long a key
+    # is held. They light up the button they belong to (see LONG_PRESS).
+    "long press ok": (
+        "OK",
+        FeatureName.Select,
+        lambda r: r.atv.remote_control.select(action=InputAction.Hold),
+    ),
+    "long press home": (
+        "HOME",
+        FeatureName.Home,
+        lambda r: r.atv.remote_control.home(action=InputAction.Hold),
+    ),
+    "long press back": (
+        "BACK",
+        FeatureName.Menu,
+        lambda r: r.atv.remote_control.menu(action=InputAction.Hold),
+    ),
     # Volume: hotkeys only, usable while the Apple TV reports that it has the controls
     "volume down": ("VOL -", FeatureName.VolumeDown, lambda r: r.atv.audio.volume_down()),
     "mute": ("MUTE", FeatureName.VolumeUp, lambda r: pyatv_patches.press_mute(r.atv)),
     "volume up": ("VOL +", FeatureName.VolumeUp, lambda r: r.atv.audio.volume_up()),
 }
+
+LONG_PRESS = {  # long press -> the button drawn for it
+    "long press ok": "select",
+    "long press home": "home",
+    "long press back": "back",
+}
+LONG_PRESS_TIME = 1.0  # seconds pyatv holds the key down
+POWER_HOLD_TIME = 1.0  # seconds the mouse must stay down on POWER to turn off
+WAKE_ATTEMPTS = 4  # wake commands sent, three seconds apart, until the device is on
 
 KEYS = {
     "\x1b[A": "up", "\x1bOA": "up",
@@ -137,6 +171,9 @@ KEYS = {
     "[": "skip back",
     "]": "skip forward",
     "P": "power",
+    "O": "long press ok",
+    "H": "long press home",
+    "B": "long press back",
     "m": "mute",
     "+": "volume up", "=": "volume up",
     "-": "volume down", "_": "volume down",
@@ -180,7 +217,9 @@ WIDTH = 46  # widest inner width of the card
 # Smallest terminal rows / card width for the boxed and the compact layout
 FULL_ROWS, FULL_WIDTH = 25, 36
 COMPACT_ROWS, COMPACT_WIDTH = 11, 30
-FLASH_TIME = 0.18  # seconds a pressed button stays lit
+FLASH_TIME = 0.09  # seconds a pressed button stays lit
+FLASH_GAP = 0.05  # dark pause before the next flash, so quick presses show one by one
+FLASH_QUEUE = 3  # flashes that may wait their turn; more (key repeat) are not shown
 
 
 class Card:
@@ -258,7 +297,8 @@ class Remote(PushListener, PowerListener, DeviceListener):
         self.playing = None
         self.playing_at = time.monotonic()
         self.app = None
-        self.pressed = {}
+        self.flashes = {}  # button -> (start, end) of its flashes, shown one by one
+        self.power_hold = None  # (start, timer) while the mouse is held on POWER
         self.status = ("ready", MUTED)
         self.exit_message = None
         self.stop = asyncio.Event()
@@ -333,9 +373,20 @@ class Remote(PushListener, PowerListener, DeviceListener):
 
     async def toggle_power(self):
         if self._power_on():
-            await self.atv.power.turn_off()
-        else:
+            if self.atv.power.get(Protocol.Companion):
+                # Paired with Companion: the same command the physical remote sends
+                await self.atv.power.turn_off()
+            else:
+                # pyatv's way without Companion (hold Home, select) no longer works
+                await pyatv_patches.sleep(self.atv)
+            return
+        # A wake sent while the Apple TV is still falling asleep is ignored: repeat it
+        for _ in range(WAKE_ATTEMPTS):
             await self.atv.power.turn_on()
+            for _ in range(12):
+                await asyncio.sleep(0.25)
+                if self._power_on():
+                    return
 
     def available(self, button):
         feature = BUTTONS[button][1]
@@ -349,8 +400,10 @@ class Remote(PushListener, PowerListener, DeviceListener):
         for key in KEY_RE.findall(os.read(fd, 256).decode(errors="ignore")):
             mouse = MOUSE_RE.fullmatch(key)
             if mouse:
-                if mouse[4] == "M":  # press, not release
+                if mouse[4] == "M":
                     self.mouse(int(mouse[1]), int(mouse[2]), int(mouse[3]))
+                elif int(mouse[1]) == 0:  # left button released
+                    self.end_power_hold()
             elif self.input is not None:
                 self.input_key(key)
             elif key == "/":
@@ -397,13 +450,44 @@ class Remote(PushListener, PowerListener, DeviceListener):
         elif button == 0:  # left click
             for line, first, last, (kind, target) in self.hitboxes:
                 if line == row and first <= column <= last:
-                    if kind == "button":
+                    if kind == "button" and target == "power" and self._power_on():
+                        self.begin_power_hold()
+                    elif kind == "button":
                         self.press(target)
                     elif kind == "prompt":
                         self.input = ""
                     else:
                         self.pick(target)
                     break
+
+    def begin_power_hold(self):
+        """Turning off by mouse takes a held click, so a stray one cannot do it.
+
+        Unlike keys, the mouse reports both press and release.
+        """
+        if not self.available("power"):
+            self.status = ("power is not available right now", WARN)
+            return
+        loop = asyncio.get_running_loop()
+        timer = loop.call_later(POWER_HOLD_TIME, self._power_hold_done)
+        self.power_hold = (time.monotonic(), timer)
+        self.status = ("keep holding to turn off…", WARN)
+        self._power_hold_tick()
+
+    def _power_hold_tick(self):
+        if self.power_hold:  # redraw the button as it fills up
+            self.draw()
+            asyncio.get_running_loop().call_later(0.04, self._power_hold_tick)
+
+    def _power_hold_done(self):
+        self.power_hold = None
+        self.press("power")
+
+    def end_power_hold(self):
+        if self.power_hold:
+            self.power_hold[1].cancel()
+            self.power_hold = None
+            self.status = ("hold POWER for a second to turn off", MUTED)
 
     def pick(self, item):
         """Click on a completion: fill it in, or run it if nothing is left to add."""
@@ -414,11 +498,28 @@ class Remote(PushListener, PowerListener, DeviceListener):
         else:
             self.input, self.cycle = item.value, None
 
+    def flash(self, button):
+        """Light a button up; presses in quick succession blink one after another."""
+        now = time.monotonic()
+        # A long press lights up its button for as long as the key is held down
+        duration = LONG_PRESS_TIME if button in LONG_PRESS else FLASH_TIME
+        button = LONG_PRESS.get(button, button)
+        flashes = self.flashes.setdefault(button, [])
+        flashes[:] = [(start, end) for start, end in flashes if end + FLASH_GAP > now]
+        if len(flashes) >= FLASH_QUEUE:
+            return
+        start = max([now] + [end + FLASH_GAP for _, end in flashes[-1:]])
+        flashes.append((start, start + duration))
+        # The regular redraw is too coarse for this: draw when it lights up and ends
+        loop = asyncio.get_running_loop()
+        for moment in (start, start + duration):
+            loop.call_later(moment - now + 0.001, self.draw)
+
     def press(self, button):
         if not self.available(button):
             self.status = (f"{button} is not available right now", WARN)
             return
-        self.pressed[button] = time.monotonic()
+        self.flash(button)
         try:
             self.queue.put_nowait(button)
         except asyncio.QueueFull:
@@ -618,8 +719,13 @@ class Remote(PushListener, PowerListener, DeviceListener):
 
     def _cell(self, button, width):
         label = BUTTONS[button][0].center(width)
-        if time.monotonic() - self.pressed.get(button, 0) < FLASH_TIME:
+        now = time.monotonic()
+        if any(start <= now < end for start, end in self.flashes.get(button, ())):
             text = f"{FLASH}{label}{RESET}"
+        elif button == "power" and self.power_hold:
+            # Fills up from the left while the mouse is held down on it
+            filled = round(width * (now - self.power_hold[0]) / POWER_HOLD_TIME)
+            text = f"{FLASH}{label[:filled]}{RESET}{TEXT}{BOLD}{label[filled:]}{RESET}"
         elif not self.available(button):
             text = f"{BORDER}{label}{RESET}"
         else:
@@ -737,10 +843,11 @@ class Remote(PushListener, PowerListener, DeviceListener):
         legend = [
             (("↑↓←→", "move"), ("enter", "ok"), ("esc", "back")),
             (("h", "home"), ("space", "play/pause"), ("[ ]", "skip")),
+            (("O H B", "long press ok, home, back"),),
             (("/", "command"), ("P", "power"), ("q", "quit")),
         ]
         if self.available("volume up"):
-            legend.insert(2, (("+ -", "volume"), ("m", "mute")))
+            legend.insert(3, (("+ -", "volume"), ("m", "mute")))
         show_legend, roomy = spare > len(legend), spare > len(legend) + 3
         media = self._media()
         card = Card(width)
@@ -945,6 +1052,7 @@ class Remote(PushListener, PowerListener, DeviceListener):
             ("remote via", getattr(atv.remote_control.main_protocol, "name", "none")),
             ("metadata via", getattr(atv.metadata.main_protocol, "name", "none")),
             ("audio via", getattr(atv.audio.main_protocol, "name", "none")),
+            ("power via", getattr(atv.power.main_protocol, "name", "none")),
             ("features", f"{available} of {len(features)} available"),
             ("uptime", f"{time.monotonic() - stats.connected_at:.0f} s"),
             ("Events", None),
@@ -1075,6 +1183,8 @@ class Remote(PushListener, PowerListener, DeviceListener):
             lines[y] = "".join(shown)
 
     def draw(self):
+        if self.stop.is_set():  # a late flash must not draw over the restored terminal
+            return
         cols, rows = shutil.get_terminal_size()
         self._zones = []
         lines = self.frame(cols, rows)
@@ -1214,6 +1324,17 @@ def offer_to_save(password):
         path.write_text(password + "\n")
 
 
+def pairing_removed(error):
+    """Whether an error, or what caused it, says that the pairing is gone."""
+    while error is not None:
+        if isinstance(error, pyatv_patches.PairingRemoved) or (
+            "no longer accepts the stored pairing" in str(error)
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 async def login(conf, storage, password):
     """Connect, asking for the AirPlay password when it is needed or was wrong.
 
@@ -1228,6 +1349,11 @@ async def login(conf, storage, password):
                 f"Connecting to {conf.name}…", connect(conf, storage, password)
             )
         except Exception as ex:  # pylint: disable=broad-except
+            if pairing_removed(ex):
+                raise Failure(
+                    f"{conf.name} no longer accepts the stored pairing; it may have "
+                    "been removed on the Apple TV.\nPair again with: sofatui pair"
+                ) from ex
             # A refused password surfaces as (or wrapped around) an authentication error
             refused = isinstance(ex, exceptions.AuthenticationError) or isinstance(
                 ex.__cause__, exceptions.AuthenticationError
@@ -1245,7 +1371,7 @@ async def login(conf, storage, password):
 
 def parse_args():
     argv = sys.argv[1:]
-    command = argv[0] if argv and argv[0] in ("stream", "stop") else "remote"
+    command = argv[0] if argv and argv[0] in ("stream", "stop", "pair") else "remote"
 
     def device_options(parser):
         parser.add_argument(
@@ -1282,6 +1408,17 @@ def parse_args():
             help="keep streaming in the background and return",
         )
         args = parser.parse_args(argv[1:])
+    elif command == "pair":
+        parser = argparse.ArgumentParser(
+            prog="sofatui pair",
+            description="Pair with the Apple TV: AirPlay for the remote and streaming, "
+            "Companion for turning it off the way the physical remote does.",
+        )
+        device_options(parser)
+        parser.add_argument(
+            "--again", action="store_true", help="pair even if already paired"
+        )
+        args = parser.parse_args(argv[1:])
     elif command == "stop":
         parser = argparse.ArgumentParser(
             prog="sofatui stop", description="Stop streams running in the background."
@@ -1294,8 +1431,9 @@ def parse_args():
             description="Terminal remote control for the Apple TV. Keys and mouse "
             'clicks press remote buttons; "/" opens a command prompt (try /stream '
             "<file>).",
-            epilog='Other commands: "sofatui stream <file> [host]" plays a file '
-            'without the remote, "sofatui stop [host]" stops background streams.',
+            epilog='Other commands: "sofatui pair [host]" pairs with the Apple TV, '
+            '"sofatui stream <file> [host]" plays a file without the remote, '
+            '"sofatui stop [host]" stops background streams.',
         )
         device_options(parser)
         parser.add_argument(
@@ -1313,7 +1451,7 @@ async def run(args):
     conf, storage = await spinner(
         f"Looking for {args.host or 'an Apple TV'}…", find(args.host)
     )
-    atv, password = await login(conf, storage, args.password or stored_password())
+    atv, password = await login_paired(conf, storage, args)
     remote = Remote(conf, password, atv)
     try:
         await remote.run()
@@ -1343,7 +1481,7 @@ async def run_stream(args):
         f"Looking for {args.host or 'an Apple TV'}…", find(args.host)
     )
     address = str(conf.address)
-    atv, password = await login(conf, storage, args.password or stored_password())
+    atv, password = await login_paired(conf, storage, args)
 
     if args.detach:  # the password is known to work now; hand over to a new process
         await asyncio.gather(*atv.close(), return_exceptions=True)
@@ -1426,6 +1564,115 @@ async def run_stream(args):
             background.release(address, lock)
 
 
+async def run_pair(args):
+    """Pair the protocols sofatui uses and store the credentials for pyatv."""
+    logging.basicConfig(level=logging.CRITICAL)
+    pyatv_patches.apply()
+    conf, storage = await spinner(
+        f"Looking for {args.host or 'an Apple TV'}…", find(args.host)
+    )
+    print(f"{ACCENT}◆{RESET} {BOLD}{conf.name}{RESET}")
+    await pair_protocols(conf, storage, args, again=args.again, report=True)
+
+
+async def pair_protocols(conf, storage, args, *, again=False, verify=True, report=False):
+    """Pair what is not paired, or no longer accepted by the device.
+
+    With verify, the device is asked whether it still accepts a stored pairing. With
+    report, protocols that need nothing are listed too.
+    """
+    for protocol in (Protocol.AirPlay, Protocol.Companion):
+        service = conf.get_service(protocol)
+        name = protocol.name
+        if service is None:
+            if report:
+                print(f"  {MUTED}{name}: not offered by this device{RESET}")
+        elif (
+            service.credentials
+            and not again
+            and not (verify and not await pyatv_patches.pairing_accepted(conf, protocol))
+        ):
+            if report:
+                print(f"  {GOOD}✓{RESET} {name}: already paired")
+        elif service.pairing in (PairingRequirement.Unsupported, PairingRequirement.Disabled):
+            print(f"  {WARN}!{RESET} {name}: the device does not allow pairing (see its AirPlay access setting)")
+        else:
+            if service.credentials and not again:
+                print(f"  {WARN}!{RESET} {name}: the pairing was removed on the device")
+            await pair_protocol(conf, storage, protocol, args)
+    await storage.save()
+
+
+async def login_paired(conf, storage, args):
+    """Connect, pairing first if that was never done or has been removed."""
+    interactive = sys.stdin.isatty()
+    password = args.password or stored_password()
+    airplay = conf.get_service(Protocol.AirPlay)
+
+    if airplay and not airplay.credentials:  # without it there is no remote control
+        if not interactive:
+            raise Failure(f"{conf.name} is not paired yet; run: sofatui pair")
+        print(f"{ACCENT}◆{RESET} {BOLD}{conf.name}{RESET} is not paired yet")
+        await pair_protocols(conf, storage, args, verify=False)
+        if not airplay.credentials:
+            raise Failure(f"{conf.name} is not paired; run sofatui pair when ready")
+
+    try:
+        return await login(conf, storage, password)
+    except Failure as ex:
+        if not (interactive and pairing_removed(ex)):
+            raise
+    print(f"{ACCENT}◆{RESET} {BOLD}{conf.name}{RESET} no longer accepts the stored pairing")
+    await pair_protocols(conf, storage, args)
+    return await login(conf, storage, password)
+
+
+async def pair_protocol(conf, storage, protocol, args):
+    name = protocol.name
+    service = conf.get_service(protocol)
+    stored = getattr((await storage.get_settings(conf)).protocols, name.lower())
+
+    # When pairing again, the old credentials have to go first: pyatv would use them
+    # for the pairing connection, which the device then drops (seen with Companion)
+    previous = service.credentials
+    service.credentials = stored.credentials = None
+
+    pairing = await pyatv.pair(
+        conf, protocol, asyncio.get_running_loop(), storage=storage, name="sofatui"
+    )
+    paired = False
+    try:
+        await pairing.begin()
+        if needs_password(conf):
+            # A password protected device shows no PIN: its AirPlay password is the
+            # PIN, for AirPlay and Companion alike
+            pin = args.password or stored_password() or ask_password(conf.name)
+        elif pairing.device_provides_pin:
+            pin = input(
+                f"  {ACCENT}›{RESET} {name}: PIN shown on the TV (empty to skip): "
+            ).strip()
+            if not pin:
+                print(f"  {MUTED}{name}: skipped{RESET}")
+                return
+        else:
+            pin = "1111"
+            input(f"  {ACCENT}›{RESET} {name}: enter {pin} on the device, then press Enter ")
+        pairing.pin(pin)
+        await pairing.finish()
+        paired = pairing.has_paired
+        if paired:
+            print(f"  {GOOD}✓{RESET} {name}: paired")
+        else:
+            print(f"  {BAD}✗{RESET} {name}: the device did not accept the pairing")
+    except Exception as ex:  # pylint: disable=broad-except
+        reason = str(ex) or type(ex).__name__
+        print(f"  {BAD}✗{RESET} {name}: pairing failed: {reason}")
+    finally:
+        await pairing.close()
+        if not paired and previous:  # keep what worked before
+            service.credentials = stored.credentials = previous
+
+
 def run_stop(args):
     streams = background.all_running()
     if args.host:
@@ -1445,7 +1692,8 @@ def main():
     if args.command == "remote" and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise SystemExit("sofatui needs an interactive terminal")
     try:
-        asyncio.run(run_stream(args) if args.command == "stream" else run(args))
+        runner = {"stream": run_stream, "pair": run_pair}.get(args.command, run)
+        asyncio.run(runner(args))
     except KeyboardInterrupt:
         pass
     except Failure as ex:

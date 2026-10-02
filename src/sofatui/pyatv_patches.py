@@ -5,7 +5,12 @@ sofatui starts (see apply):
 
 * AirPlay 2 passwords: the device answers SETUP with a digest challenge that pyatv
   only handles for AirPlay 1.
+* Removed pairings: when the pairing was deleted on the device, it answers the
+  credential check with an error that pyatv does not look at; the connection then
+  fails later with a timeout. The answer is checked here.
 * Mute: pyatv has no command for the remote's mute key, so one is added.
+* Sleep: pyatv turns the device off by holding Home and pressing select, which on
+  current tvOS only opens Control Centre. The sleep key still works and is used here.
 * HLS playlists: the device does not fetch them itself but asks the sender to, which
   lets the sender use the cookies and headers a site expects. pyatv ignores the request.
 * Playing a URL: the device ignores the old "POST /play". Media is instead queued
@@ -25,15 +30,21 @@ import urllib.request
 from uuid import uuid4
 
 from pyatv import exceptions
+from pyatv.auth import hap_tlv8
 from pyatv.auth.hap_channel import setup_channel
+from pyatv.auth.hap_pairing import parse_credentials
+from pyatv.auth.hap_srp import SRPAuthHandler
 from pyatv.const import InputAction, Protocol
 from pyatv.protocols import mrp
 from pyatv.protocols.airplay import player
-from pyatv.protocols.airplay.auth import verify_connection
+from pyatv.protocols.airplay.auth import hap as airplay_hap
+from pyatv.protocols.airplay.auth import pair_verify, verify_connection
 from pyatv.protocols.airplay.channels import EventChannel
 from pyatv.protocols.airplay.utils import decode_plist_body
+from pyatv.protocols.companion import protocol as companion
+from pyatv.protocols.companion.connection import CompanionConnection, FrameType
 from pyatv.protocols.raop.protocols import airplayv2
-from pyatv.support.http import decode_bplist_from_body
+from pyatv.support.http import decode_bplist_from_body, http_connect
 from pyatv.support.rtsp import DigestInfo, RtspSession
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,6 +60,48 @@ _passwords: Dict[str, str] = {}  # device address -> AirPlay password
 _fetch_headers: Dict[str, str] = {}  # sent when fetching playlists for the device
 _playing_listener = None  # called once the device reports that playback started
 _applied = False
+
+
+class PairingRemoved(exceptions.InvalidCredentialsError):
+    """The device no longer accepts the stored pairing."""
+
+    def __init__(self) -> None:
+        super().__init__("the device no longer accepts the stored pairing")
+
+
+def _check_verify_answer(data) -> None:
+    """Raise if the answer to a credential check carries an error."""
+    if isinstance(data, bytes) and hap_tlv8.TlvValue.Error in hap_tlv8.read_tlv(data):
+        raise PairingRemoved()
+
+
+async def pairing_accepted(conf, protocol) -> bool:
+    """Ask the device whether it still accepts the stored pairing of a protocol."""
+    service = conf.get_service(protocol)
+    try:
+        if protocol == Protocol.Companion:
+            connection = CompanionConnection(
+                asyncio.get_running_loop(), str(conf.address), service.port
+            )
+            session = companion.CompanionProtocol(connection, SRPAuthHandler(), service)
+            try:
+                await session.start()
+            finally:
+                session.stop()
+        else:
+            http = await http_connect(str(conf.address), service.port)
+            try:
+                credentials = parse_credentials(service.credentials)
+                await pair_verify(credentials, http).verify_credentials()
+            finally:
+                http.close()
+    except exceptions.InvalidCredentialsError:
+        return False
+    except exceptions.AuthenticationError as ex:
+        if isinstance(ex.__cause__, exceptions.InvalidCredentialsError):
+            return False
+        raise
+    return True
 
 
 def set_password(address: str, password: str) -> None:
@@ -333,6 +386,15 @@ async def _wait_for_playback_state(self, playback_state) -> None:
         await asyncio.sleep(1)
 
 
+async def sleep(atv) -> None:
+    """Put the device to sleep with the sleep key."""
+    control = atv.remote_control.get(Protocol.MRP)
+    if control is None:
+        raise exceptions.NotSupportedError("sleep needs the remote control connection")
+    # pylint: disable-next=protected-access
+    await mrp._send_hid_key(control.protocol, "suspend", InputAction.SingleTap)
+
+
 async def press_mute(atv) -> None:
     """Press the mute key, which pyatv has no command for."""
     control = atv.remote_control.get(Protocol.MRP)
@@ -353,6 +415,26 @@ def apply() -> None:
         )
 
     RtspSession.setup = _setup
+
+    # Check the answers to credential checks, which pyatv leaves unread
+    send = airplay_hap.AirPlayHapPairVerifyProcedure._send
+
+    async def _send_and_check(self, data):
+        response = await send(self, data)
+        _check_verify_answer(response.body)
+        return response
+
+    airplay_hap.AirPlayHapPairVerifyProcedure._send = _send_and_check
+
+    exchange_auth = companion.CompanionProtocol.exchange_auth
+
+    async def _exchange_and_check(self, frame_type, data, *args, **kwargs):
+        response = await exchange_auth(self, frame_type, data, *args, **kwargs)
+        if frame_type in (FrameType.PV_Start, FrameType.PV_Next):
+            _check_verify_answer(response.get("_pd"))
+        return response
+
+    companion.CompanionProtocol.exchange_auth = _exchange_and_check
     mrp._KEY_LOOKUP["mute"] = MUTE_KEY  # pylint: disable=protected-access
     airplayv2.AirPlayV2 = _AirPlayV2
 
