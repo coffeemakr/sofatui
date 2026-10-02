@@ -21,7 +21,7 @@ import tempfile
 import time
 
 PASSWORD_ENV = "AIRPLAY_PASSWORD"
-START_TIMEOUT = 45  # seconds for a background stream to connect
+START_TIMEOUT = 45  # seconds for a background stream to connect to the device
 STOP_TIMEOUT = 8  # seconds to wait for a stream to end before killing it
 
 
@@ -57,6 +57,14 @@ def claim(address: str, info: dict):
     json.dump(info, handle)
     handle.flush()
     return handle
+
+
+def update(handle, info: dict) -> None:
+    """Replace the info of a claimed stream, e.g. as it goes from loading to playing."""
+    handle.seek(0)
+    handle.truncate()
+    json.dump(info, handle)
+    handle.flush()
 
 
 def release(address: str, handle) -> None:
@@ -112,6 +120,11 @@ def stop(address: str):
     return info
 
 
+def title(info: dict) -> str:
+    """What a stream plays, for display."""
+    return info.get("title") or Path(info["file"]).name
+
+
 def last_log_line(address: str) -> str:
     try:
         lines = log_file(address).read_text(encoding="utf-8").strip().splitlines()
@@ -120,14 +133,14 @@ def last_log_line(address: str) -> str:
     return lines[-1] if lines else ""
 
 
-def spawn(path: Path, address: str, password) -> subprocess.Popen:
-    """Start "sofatui stream" for a file, detached from this terminal."""
+def spawn(source: str, address: str, password, options=()) -> subprocess.Popen:
+    """Start "sofatui stream" for a file or page, detached from this terminal."""
     env = dict(os.environ)
     if password:
         env[PASSWORD_ENV] = password  # not on the command line, where ps shows it
     with open(log_file(address), "w", encoding="utf-8") as log:
         return subprocess.Popen(  # pylint: disable=consider-using-with
-            [sys.executable, "-m", "sofatui", "stream", str(path), address],
+            [sys.executable, "-m", "sofatui", "stream", *options, source, address],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -136,9 +149,9 @@ def spawn(path: Path, address: str, password) -> subprocess.Popen:
         )
 
 
-async def start(path: Path, address: str, password) -> subprocess.Popen:
-    """Start a background stream and wait until it is connected and playing."""
-    process = spawn(path.resolve(), address, password)
+async def start(source: str, address: str, password, options=()) -> subprocess.Popen:
+    """Start a background stream and wait until it is connected to the device."""
+    process = spawn(source, address, password, options)
     deadline = time.monotonic() + START_TIMEOUT
     while time.monotonic() < deadline:
         info = running(address)

@@ -6,6 +6,8 @@ sofatui starts (see apply):
 * AirPlay 2 passwords: the device answers SETUP with a digest challenge that pyatv
   only handles for AirPlay 1.
 * Mute: pyatv has no command for the remote's mute key, so one is added.
+* HLS playlists: the device does not fetch them itself but asks the sender to, which
+  lets the sender use the cookies and headers a site expects. pyatv ignores the request.
 * Playing a URL: the device ignores the old "POST /play". Media is instead queued
   over a media control stream with "POST /command", and playback state is reported
   on the event channel. This follows https://github.com/postlund/pyatv/pull/2846.
@@ -17,7 +19,9 @@ import asyncio
 from importlib.metadata import version
 import logging
 import plistlib
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+import urllib.error
+import urllib.request
 from uuid import uuid4
 
 from pyatv import exceptions
@@ -39,13 +43,44 @@ MEDIA_CONTROL_STREAM_TYPE = 130  # stream used to play media from a URL
 MUTE_KEY = (12, 0xE2)  # HID consumer page, "Mute": the mute button on the remote
 START_TIMEOUT = 30  # seconds to wait for playback to start
 
+FETCH_TIMEOUT = 20  # seconds for a playlist the device asked us to fetch
+
 _passwords: Dict[str, str] = {}  # device address -> AirPlay password
+_fetch_headers: Dict[str, str] = {}  # sent when fetching playlists for the device
+_playing_listener = None  # called once the device reports that playback started
 _applied = False
 
 
 def set_password(address: str, password: str) -> None:
     """Register the AirPlay password to use for a device."""
     _passwords[address] = password
+
+
+def set_playing_listener(listener) -> None:
+    """Set a function to call when the device has actually started playing."""
+    global _playing_listener  # pylint: disable=global-statement
+    _playing_listener = listener
+
+
+def set_fetch_headers(headers: Dict[str, str]) -> None:
+    """Set the HTTP headers to use when the device asks us to fetch a playlist."""
+    _fetch_headers.clear()
+    _fetch_headers.update(headers)
+
+
+def _fetch(url: str, headers: Dict[str, str]) -> Tuple[int, str, bytes]:
+    """Fetch a URL; returns status, content type and body."""
+    # No compressed transfer: the body is handed on as it is
+    headers = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as response:
+            content_type = response.headers.get("Content-Type", "")
+            return response.status, content_type, response.read()
+    except urllib.error.HTTPError as ex:
+        return ex.code, "", b""
+    except OSError:
+        return 504, "", b""
 
 
 async def _setup(self, headers=None, body=None):
@@ -65,9 +100,9 @@ async def _setup(self, headers=None, body=None):
 
 
 class _EventChannel(EventChannel):
-    """Event channel that passes playback state updates on to a listener."""
+    """Event channel that passes the commands of the device on to a listener."""
 
-    playback_state_listener = None
+    command_listener = None
 
     def _handle_command(self, request) -> None:
         # Commands from the receiver are wrapped as a plist inside a plist
@@ -79,12 +114,8 @@ class _EventChannel(EventChannel):
         command = decode_plist_body(data) if data else None
         _LOGGER.debug("Command on event channel: %s", command or outer)
 
-        if (
-            isinstance(command, dict)
-            and command.get("type") == "playbackState"
-            and self.playback_state_listener is not None
-        ):
-            self.playback_state_listener(command)
+        if isinstance(command, dict) and self.command_listener is not None:
+            self.command_listener(command)
 
     def handle_received(self) -> None:
         # Look at the complete requests first; the base class then answers them
@@ -115,9 +146,37 @@ class _AirPlayV2(airplayv2.AirPlayV2):
             "CSeq": "1",
         }
         self._playback_state: Optional[Dict[str, Any]] = None
+        self._tasks: set = set()
 
-    def _playback_state_updated(self, state: Dict[str, Any]) -> None:
-        self._playback_state = state
+    def _command_received(self, command: Dict[str, Any]) -> None:
+        if command.get("type") == "playbackState":
+            self._playback_state = command
+        elif command.get("type") == "unhandledURL" and command.get("kind") == "request":
+            task = asyncio.ensure_future(self._answer_url_request(command))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _answer_url_request(self, command: Dict[str, Any]) -> None:
+        """Fetch a playlist (or key) for the device and send it back."""
+        request = command["request"]
+        url = request["FCUP_Response_URL"]
+        headers = _fetch_headers or request.get("FCUP_Response_Headers", {})
+        status, content_type, data = await asyncio.to_thread(_fetch, url, headers)
+        _LOGGER.debug("Fetched %s for the device: %d, %d bytes", url, status, len(data))
+        await self._send_command(
+            {
+                "kind": "response",
+                "type": "unhandledURL",
+                "messageID": command.get("messageID"),
+                "response": {
+                    "FCUP_Response_RequestID": request.get("FCUP_Response_RequestID"),
+                    "FCUP_Response_URL": url,
+                    "FCUP_Response_StatusCode": status,
+                    "FCUP_Response_Data": data,
+                    "FCUP_Response_Headers": {"Content-Type": content_type},
+                },
+            }
+        )
 
     async def _setup_base(self, timing_server_port: int) -> None:
         self._verifier = await verify_connection(
@@ -169,7 +228,7 @@ class _AirPlayV2(airplayv2.AirPlayV2):
                 await asyncio.sleep(1.0)
 
         self.event_channel = transport
-        channel.playback_state_listener = self._playback_state_updated
+        channel.command_listener = self._command_received
 
     async def _send_command(self, command: Dict[str, Any]):
         body = {
@@ -259,6 +318,8 @@ async def _wait_for_playback_state(self, playback_state) -> None:
 
         state = playback_state()
         if state == "playing":
+            if not video_started and _playing_listener:
+                _playing_listener()
             video_started = True
         elif state == "stopped" and video_started:
             _LOGGER.debug("media playback ended")

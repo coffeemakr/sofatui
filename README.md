@@ -100,13 +100,13 @@ Shift+drag.
 
 ## Commands
 
-| Command          | Does                                                 |
-|------------------|------------------------------------------------------|
-| `/stream <file>` | Play a local file on the Apple TV, in the background |
-| `/stop`          | Stop the background stream                           |
-| `/info`          | Show details about the Apple TV and this session     |
-| `/help`          | List the commands                                    |
-| `/quit`          | Leave sofatui                                        |
+| Command                 | Does                                                        |
+|-------------------------|-------------------------------------------------------------|
+| `/stream <file or URL>` | Play a local file or a web video, in the background         |
+| `/stop`                 | Stop the background stream                                  |
+| `/info`                 | Show details about the Apple TV and this session            |
+| `/help`                 | List the commands                                           |
+| `/quit`                 | Leave sofatui                                               |
 
 In the prompt, Tab (or ↓) completes commands and file paths and then steps through the
 matches, Shift+Tab (or ↑) steps backwards, and Esc closes it. Suggestions can be
@@ -132,6 +132,43 @@ sofatui stop [host]                 # stop background streams
 There is one stream per device; starting another replaces it. The stream ends when the
 machine sleeps or shuts down.
 
+## Web videos
+
+`/stream <URL>` (or `sofatui stream <URL>`) plays the video of a web page, found with
+[yt-dlp](https://github.com/yt-dlp/yt-dlp). yt-dlp is optional: sofatui uses the
+`yt-dlp` command if it is installed, with your own configuration and cookies, and
+otherwise the module that comes with the `yt` extra:
+
+```sh
+uvx --from "sofatui[yt]" sofatui
+```
+
+How the video reaches the Apple TV is chosen automatically, or with `--via`:
+
+| Route      | What happens                                                              |
+|------------|---------------------------------------------------------------------------|
+| `direct`   | The Apple TV loads the video from the site itself                         |
+| `relay`    | All traffic goes through sofatui, with the headers the site expects       |
+| `download` | The whole video is downloaded first, then streamed like a local file      |
+
+- **direct** is used when the site offers an HLS playlist or one file with video and
+  audio. For HLS the Apple TV asks sofatui to fetch the playlist; it loads the rest
+  itself.
+- **relay** is used when yt-dlp reports headers the site checks on every request: a
+  referrer, cookies, or the address yt-dlp sends to get around a region check. The
+  Apple TV would send none of them. The video then flows through your machine for as
+  long as it plays.
+- **download** is used when video and audio only come separately (the better qualities
+  on YouTube). It needs `ffmpeg`; downloads are kept in `~/.cache/sofatui`.
+
+```sh
+sofatui stream --via relay <URL>     # also: /stream --via relay <URL> in the remote
+```
+
+If a stream fails with "the Apple TV could not load the video", try the next route.
+If yt-dlp cannot open a page, sofatui cannot either: sites that ask for a login or a
+bot check need the cookies set up in yt-dlp's own configuration.
+
 ## Releasing
 
 Bump the version with `uv version --bump patch` (or `minor`, `major`), commit, and
@@ -154,10 +191,6 @@ sofatui stands on the shoulders of [pyatv](https://pyatv.dev) by
 [@postlund](https://github.com/postlund) and its contributors. Discovery, pairing,
 the remote control protocol and AirPlay are all pyatv; sofatui is only the couch-side
 interface on top. If you want to talk to an Apple TV from Python, start there.
-
-Thanks also to [@jlacivita](https://github.com/jlacivita), whose pull request
-[pyatv#2846](https://github.com/postlund/pyatv/pull/2846) showed how current tvOS
-expects URL playback to be started.
 
 ## License
 

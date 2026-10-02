@@ -24,12 +24,14 @@ from types import SimpleNamespace
 from pwinput import pwinput
 import pyatv
 from pyatv import exceptions
+from pyatv.support.net import get_local_address_reaching
 from pyatv.const import DeviceState, FeatureName, FeatureState, PowerState, Protocol
 from pyatv.interface import DeviceListener, PowerListener, PushListener
 from pyatv.storage.file_storage import FileStorage
 
-from sofatui import __version__, background, pyatv_patches
+from sofatui import __version__, background, pyatv_patches, ytdlp
 from sofatui.background import PASSWORD_ENV
+from sofatui.relay import Relay
 
 # Where the AirPlay password is looked up when not given on the command line
 PASSWORD_FILES = (
@@ -156,13 +158,20 @@ STATES = {
 
 # command -> (argument, description), typed after "/"
 COMMANDS = {
-    "stream": ("<file>", "play a local file"),
+    "stream": ("<file or URL>", "play a file or page"),
     "stop": ("", "stop the stream"),
     "info": ("", "device details"),
     "help": ("", "list commands"),
     "quit": ("", "leave the remote"),
 }
 HIDDEN_COMMANDS = {"nerd"}  # work, but are not listed or completed
+# How a web video reaches the Apple TV ("sofatui stream --via", "/stream --via")
+VIA_MODES = {
+    "auto": "relay if the site needs it, download if there is no single stream",
+    "direct": "the Apple TV loads the video from the site itself",
+    "relay": "all traffic goes through this machine, with the headers the site expects",
+    "download": "download the whole video first, then stream the file",
+}
 MEDIA_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mp3", ".m4a", ".aac", ".wav"}
 MAX_SUGGESTIONS = 6  # completion rows shown above the command prompt
 CURSOR = "\x1b[7m \x1b[27m"
@@ -263,6 +272,7 @@ class Remote(PushListener, PowerListener, DeviceListener):
         self.view = "remote"  # or "info" / "nerd", the sheets opened by commands
         self.scroll = 0  # first visible row of a sheet
         self.stream_info = None  # state of the background stream, if any
+        self._stream_phase = None
         self.stats = SimpleNamespace(
             connected_at=time.monotonic(),
             sent=0,
@@ -474,6 +484,8 @@ class Remote(PushListener, PowerListener, DeviceListener):
                     for name, (usage, text) in COMMANDS.items()
                     if name.startswith(command)
                 ]
+            elif command == "stream" and arg.strip().lower().startswith("http"):
+                items, heading = [], "web page, played through yt-dlp"
             elif command == "stream":
                 items = media_files(arg.lstrip())
                 for item in items:
@@ -521,13 +533,23 @@ class Remote(PushListener, PowerListener, DeviceListener):
         task.add_done_callback(self._tasks.discard)
 
     def cmd_stream(self, arg):
+        options = []
+        via = re.match(r"--via\s+(\S+)\s*(.*)", arg)
+        if via:
+            if via[1] not in VIA_MODES:
+                self.status = (f"--via takes one of: {', '.join(VIA_MODES)}", WARN)
+                return
+            options, arg = ["--via", via[1]], via[2].strip()
+
         path = Path(os.path.expanduser(arg))
         if not arg:
-            self.status = ("usage: /stream <file>", WARN)
+            self.status = ("usage: /stream [--via <mode>] <file or URL>", WARN)
+        elif ytdlp.is_url(arg):
+            self._spawn(self._start_stream(arg, "the web page", options))
         elif not path.is_file():
             self.status = (f"no such file: {arg}", BAD)
         else:
-            self._spawn(self._start_stream(path))
+            self._spawn(self._start_stream(str(path.resolve()), path.name))
 
     def cmd_stop(self, arg):
         self._spawn(self._stop_stream())
@@ -545,23 +567,25 @@ class Remote(PushListener, PowerListener, DeviceListener):
     def cmd_quit(self, arg):
         self.stop.set()
 
-    async def _start_stream(self, path):
-        """Play a file from a detached process, so it survives quitting the remote."""
-        self.status = (f"starting stream of {path.name}…", WARN)
+    async def _start_stream(self, source, label, options=()):
+        """Play a file or page from a detached process, which survives quitting."""
+        self.status = (f"starting stream of {label}…", WARN)
         try:
-            process = await background.start(path, self.address, self.password)
+            process = await background.start(
+                source, self.address, self.password, options
+            )
         except background.StreamError as ex:
             self.status = (f"stream failed: {ex}", BAD)
         else:
             self._processes.append(process)
-            self.streaming = path.name
+            self.streaming = label
             self.status = ("stream runs in the background", GOOD)
 
     async def _stop_stream(self):
         info = await asyncio.to_thread(background.stop, self.address)
         self.streaming = None
         if info:
-            self.status = (f"stopped stream of {Path(info['file']).name}", MUTED)
+            self.status = (f"stopped stream of {background.title(info)}", MUTED)
         else:
             self.status = ("no stream is running", MUTED)
 
@@ -569,10 +593,19 @@ class Remote(PushListener, PowerListener, DeviceListener):
         """Follow the background stream, which may start or end outside this remote."""
         while True:
             info = self.stream_info = background.running(self.address)
-            name = Path(info["file"]).name if info else None
+            name = background.title(info) if info else None
+            phase = info.get("phase") if info else None
             if self.streaming and not name:
-                self.status = (f"stream of {self.streaming} ended", MUTED)
-            self.streaming = name
+                # Its last words say why: playback ended, stopped, or what failed
+                ending = background.last_log_line(self.address)
+                failed = ending.startswith("Stream failed")
+                self.status = (
+                    ending or f"stream of {self.streaming} ended",
+                    BAD if failed else MUTED,
+                )
+            elif phase and phase != self._stream_phase:
+                self.status = (f"stream: {phase}", GOOD if phase == "playing" else WARN)
+            self.streaming, self._stream_phase = name, phase
             self._processes = [p for p in self._processes if p.poll() is None]
             await asyncio.sleep(1)
 
@@ -629,7 +662,7 @@ class Remote(PushListener, PowerListener, DeviceListener):
             icon=icon,
             label=label,
             color=color,
-            title=playing.title if playing else None,
+            title=(playing.title if playing else None) or self._stream_title(idle),
             placeholder="Nothing playing" if idle else "Untitled media",
             artist=" · ".join(x for x in (playing.artist, playing.album) if x)
             if playing
@@ -638,6 +671,13 @@ class Remote(PushListener, PowerListener, DeviceListener):
             total=total,
             times=f"{clock(position)} / {clock(total)}" if total else "",
         )
+
+    def _stream_title(self, idle):
+        """The title of our own stream, which the Apple TV does not report."""
+        info = self.stream_info
+        if info and info.get("phase") == "playing" and not idle and self.app == "AirPlay":
+            return background.title(info)
+        return None
 
     @staticmethod
     def _title(media, width):
@@ -823,7 +863,11 @@ class Remote(PushListener, PowerListener, DeviceListener):
         info = self.stream_info
         if not info:
             return [("Stream", "none")]
-        rows = [("Stream", Path(info["file"]).name)]
+        rows = [("Stream", background.title(info))]
+        if info.get("phase"):
+            rows.append(("  state", info["phase"]))
+        if info.get("via"):
+            rows.append(("  route", info["via"]))
         if "started" in info:
             rows.append(("  running for", clock(time.time() - info["started"])))
         return rows
@@ -918,7 +962,9 @@ class Remote(PushListener, PowerListener, DeviceListener):
         info = self.stream_info
         if info:
             rows += [
-                ("file", info["file"]),
+                ("source", info["file"]),
+                ("phase", info.get("phase", "?")),
+                ("route", info.get("via", "local file")),
                 ("pid", str(info["pid"])),
                 ("log", str(background.log_file(self.address))),
             ]
@@ -1217,10 +1263,18 @@ def parse_args():
     if command == "stream":
         parser = argparse.ArgumentParser(
             prog="sofatui stream",
-            description="Play a local file on the Apple TV, until playback ends.",
+            description="Play a local file, or a web page's video through yt-dlp, on "
+            "the Apple TV, until playback ends.",
         )
-        parser.add_argument("file", help="media file to play")
+        parser.add_argument("source", help="media file, or URL of a page with a video")
         device_options(parser)
+        parser.add_argument(
+            "--via",
+            choices=list(VIA_MODES),
+            default="auto",
+            help="how a web video reaches the Apple TV: "
+            + "; ".join(f"{mode}: {text}" for mode, text in VIA_MODES.items()),
+        )
         parser.add_argument(
             "-d",
             "--detach",
@@ -1271,12 +1325,19 @@ async def run(args):
 
 
 async def run_stream(args):
-    """Play a file and hold the stream until playback ends or we are told to stop."""
+    """Play a file or page and hold the stream until it ends or we are told to stop."""
     logging.basicConfig(level=logging.CRITICAL)
     pyatv_patches.apply()
-    path = Path(args.file).expanduser()
-    if not path.is_file():
-        raise Failure(f"No such file: {args.file}")
+    url = args.source if ytdlp.is_url(args.source) else None
+    path = None if url else Path(args.source).expanduser()
+    try:
+        if url:
+            ytdlp.command()  # fail before connecting if yt-dlp is missing
+        elif not path.is_file():
+            raise Failure(f"No such file: {args.source}")
+    except ytdlp.YtDlpError as ex:
+        raise Failure(str(ex)) from ex
+    source = url or str(path.resolve())
 
     conf, storage = await spinner(
         f"Looking for {args.host or 'an Apple TV'}…", find(args.host)
@@ -1286,37 +1347,81 @@ async def run_stream(args):
 
     if args.detach:  # the password is known to work now; hand over to a new process
         await asyncio.gather(*atv.close(), return_exceptions=True)
+        options = ["--via", args.via]
         try:
-            await background.start(path, address, password)
+            await background.start(source, address, password, options)
         except background.StreamError as ex:
             raise Failure(f"Stream failed: {ex}") from ex
-        print(f"Streaming {path.name} to {conf.name}; stop it with: sofatui stop")
+        print(f"Streaming to {conf.name} in the background; stop it with: sofatui stop")
         return
 
     task = asyncio.current_task()
     for sig in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
-    lock = None
+    info = {
+        "pid": os.getpid(),
+        "file": source,
+        "title": url or path.name,
+        "name": conf.name,
+        "started": time.time(),
+    }
+    lock = relay = None
+    via = None
+
+    def phase(text):
+        """Report progress to the log and to remotes watching this stream."""
+        if info.get("phase") != text:
+            info["phase"] = text
+            background.update(lock, info)
+            print(text.capitalize(), flush=True)
+
     try:
         await asyncio.to_thread(background.stop, address)  # one stream per device
-        lock = background.claim(
-            address,
-            {
-                "pid": os.getpid(),
-                "file": str(path.resolve()),
-                "name": conf.name,
-                "started": time.time(),
-            },
-        )
-        print(f"Streaming {path.name} to {conf.name}", flush=True)
-        await atv.stream.play_url(str(path))
+        lock = background.claim(address, info)
+        target = source
+        if url:
+            phase("looking up the video")
+            media = await ytdlp.resolve(url)
+            info["title"] = media.title
+            via = args.via
+            if media.kind == "download":
+                via = "download"  # nothing the Apple TV could play as it is
+            elif via == "auto":
+                via = "relay" if ytdlp.needs_relay(media.headers) else "direct"
+            info["via"] = via
+
+            if via == "download":
+                phase("downloading")
+                downloaded = await ytdlp.download(url, lambda p: phase(f"downloading {p}"))
+                target = str(downloaded)
+            elif via == "relay":
+                local = get_local_address_reaching(conf.address)
+                relay = Relay(str(local), media.headers)
+                await relay.start()
+                target = relay.url_for(media.url)
+            else:
+                pyatv_patches.set_fetch_headers(media.headers)
+                target = media.url
+
+        phase("starting playback")
+        pyatv_patches.set_playing_listener(lambda: phase("playing"))
+        print(f"Streaming {info['title']} to {conf.name}", flush=True)
+        await atv.stream.play_url(target)
         print("Playback ended", flush=True)
     except asyncio.CancelledError:
         print("Stopped", flush=True)
     except Exception as ex:  # pylint: disable=broad-except
-        raise Failure(f"Stream failed: {ex}") from ex
+        message = str(ex)
+        if via in ("direct", "relay") and isinstance(ex, exceptions.PlaybackError):
+            # The Apple TV got a playlist or file it could not load the video from
+            other = "relay" if via == "direct" else "download"
+            message = f"the Apple TV could not load the video, try --via {other}"
+        print(f"Stream failed: {message}", flush=True)
+        raise SystemExit(1) from ex
     finally:
         await asyncio.gather(*atv.close(), return_exceptions=True)
+        if relay:
+            await relay.close()
         if lock:
             background.release(address, lock)
 
@@ -1329,7 +1434,7 @@ def run_stop(args):
         print("No stream is running")
     for address, info in streams.items():
         background.stop(address)
-        print(f"Stopped {Path(info['file']).name} on {info.get('name', address)}")
+        print(f"Stopped {background.title(info)} on {info.get('name', address)}")
 
 
 def main():

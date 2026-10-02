@@ -19,6 +19,10 @@ classifiers = [
     "Topic :: Home Automation",
 ]
 
+[project.optional-dependencies]
+# Web videos for "/stream <URL>"; a yt-dlp command on the PATH is preferred if present
+yt = ["yt-dlp"]
+
 [project.urls]
 Repository = "https://github.com/coffeemakr/sofatui"
 
