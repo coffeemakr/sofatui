@@ -39,18 +39,19 @@ lines.
 With [uv](https://docs.astral.sh/uv/), no installation needed:
 
 ```sh
-uvx --from git+https://github.com/coffeemakr/sofatui sofatui            # find the Apple TV
-uvx --from git+https://github.com/coffeemakr/sofatui sofatui 192.168.1.100
+uvx sofatui                  # find the Apple TV on the network
+uvx sofatui 192.168.1.100    # or give its address
 ```
 
-From a checkout:
+Or install it as a command with `uv tool install sofatui` (or `pipx install sofatui`)
+and run `sofatui`.
+
+The latest development version runs straight from GitHub, or from a checkout:
 
 ```sh
+uvx --from git+https://github.com/coffeemakr/sofatui sofatui
 uv run sofatui [host]        # in the repository
-uvx --from . sofatui [host]  # same, as an isolated tool
 ```
-
-Or install it as a command: `uv tool install git+https://github.com/coffeemakr/sofatui`.
 
 Without a host, sofatui scans the network and connects if it finds exactly one device.
 `$ATV_HOST` sets a default address. Linux and macOS only.
