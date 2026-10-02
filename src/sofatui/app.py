@@ -7,6 +7,7 @@ file on the Apple TV.
 
 import argparse
 import asyncio
+import copy
 import logging
 from importlib.metadata import version as package_version
 import os
@@ -158,6 +159,7 @@ LONG_PRESS = {  # long press -> the button drawn for it
 LONG_PRESS_TIME = 1.0  # seconds pyatv holds the key down
 POWER_HOLD_TIME = 1.0  # seconds the mouse must stay down on POWER to turn off
 WAKE_ATTEMPTS = 4  # wake commands sent, three seconds apart, until the device is on
+POWER_COOLDOWN = 4.0  # seconds the power key is ignored after switching
 
 KEYS = {
     "\x1b[A": "up", "\x1bOA": "up",
@@ -299,6 +301,7 @@ class Remote(PushListener, PowerListener, DeviceListener):
         self.app = None
         self.flashes = {}  # button -> (start, end) of its flashes, shown one by one
         self.power_hold = None  # (start, timer) while the mouse is held on POWER
+        self.power_busy = False  # switching power, or just did: ignore the power key
         self.status = ("ready", MUTED)
         self.exit_message = None
         self.stop = asyncio.Event()
@@ -372,21 +375,48 @@ class Remote(PushListener, PowerListener, DeviceListener):
             return None
 
     async def toggle_power(self):
-        if self._power_on():
-            if self.atv.power.get(Protocol.Companion):
-                # Paired with Companion: the same command the physical remote sends
-                await self.atv.power.turn_off()
-            else:
-                # pyatv's way without Companion (hold Home, select) no longer works
-                await pyatv_patches.sleep(self.atv)
-            return
-        # A wake sent while the Apple TV is still falling asleep is ignored: repeat it
-        for _ in range(WAKE_ATTEMPTS):
-            await self.atv.power.turn_on()
-            for _ in range(12):
-                await asyncio.sleep(0.25)
-                if self._power_on():
-                    return
+        """Switch power, and say so at once: waking up takes a few seconds."""
+        self.power_busy = True
+        try:
+            if self._power_on():
+                self.status = (f"putting {self.name} to sleep…", WARN)
+                if self.atv.power.get(Protocol.Companion):
+                    # Paired with Companion: the command the physical remote sends
+                    await self.atv.power.turn_off()
+                else:
+                    # pyatv's way without Companion (hold Home, select) no longer works
+                    await pyatv_patches.sleep(self.atv)
+                return
+            self.status = (f"waking {self.name} up…", WARN)
+            # A wake can get lost, e.g. while the Apple TV is still falling asleep
+            for _ in range(WAKE_ATTEMPTS):
+                await self._wake()
+                for _ in range(12):
+                    await asyncio.sleep(0.25)
+                    if self._power_on():
+                        return
+            raise exceptions.ProtocolError(f"{self.name} did not wake up")
+        finally:
+            # Stay deaf to the power key a little longer: the television needs a
+            # moment to show a picture, and a second press would switch it off again
+            asyncio.get_running_loop().call_later(POWER_COOLDOWN, self._power_ready)
+
+    def _power_ready(self):
+        self.power_busy = False
+
+    async def _wake(self):
+        """Send every wake command there is: over Companion and the remote protocol."""
+        sent = None
+        for protocol in (Protocol.Companion, Protocol.MRP):
+            power = self.atv.power.get(protocol)
+            if power:
+                try:
+                    await power.turn_on()
+                    sent = True
+                except Exception as ex:  # pylint: disable=broad-except
+                    sent = sent or ex
+        if sent is not True:
+            raise sent or exceptions.NotSupportedError("no way to wake the device")
 
     def available(self, button):
         feature = BUTTONS[button][1]
@@ -516,6 +546,8 @@ class Remote(PushListener, PowerListener, DeviceListener):
             loop.call_later(moment - now + 0.001, self.draw)
 
     def press(self, button):
+        if button == "power" and self.power_busy:
+            return  # the status line already says what is going on
         if not self.available(button):
             self.status = (f"{button} is not available right now", WARN)
             return
@@ -523,7 +555,9 @@ class Remote(PushListener, PowerListener, DeviceListener):
         try:
             self.queue.put_nowait(button)
         except asyncio.QueueFull:
-            pass
+            return
+        if button == "power":
+            self.power_busy = True  # from now, not only once its turn comes
 
     async def worker(self):
         while True:
@@ -1279,13 +1313,25 @@ async def find(host):
     return found[0], storage
 
 
-async def connect(conf, storage, password):
+async def connect(conf, storage, password, companion=True):
+    """Connect to the device; without companion, only over AirPlay.
+
+    The Apple TV keeps one Companion session per pairing: a second one ends the
+    first, and pyatv then closes that whole connection. So only the remote uses
+    Companion, and a stream connects without it to leave the remote alone.
+    """
     if password:
         pyatv_patches.set_password(str(conf.address), password)
         for protocol in (Protocol.AirPlay, Protocol.RAOP):
             service = conf.get_service(protocol)
             if service:
                 service.password = password
+    if not companion:
+        conf = copy.deepcopy(conf)
+        service = conf.get_service(Protocol.Companion)
+        if service:
+            service.credentials = None  # pyatv skips a protocol without credentials
+        storage = None  # the stored settings would bring them back
     return await pyatv.connect(conf, asyncio.get_running_loop(), storage=storage)
 
 
@@ -1335,7 +1381,7 @@ def pairing_removed(error):
     return False
 
 
-async def login(conf, storage, password):
+async def login(conf, storage, password, companion=True):
     """Connect, asking for the AirPlay password when it is needed or was wrong.
 
     Returns the connection and the password that worked.
@@ -1346,7 +1392,8 @@ async def login(conf, storage, password):
             password, asked = ask_password(conf.name), True
         try:
             atv = await spinner(
-                f"Connecting to {conf.name}…", connect(conf, storage, password)
+                f"Connecting to {conf.name}…",
+                connect(conf, storage, password, companion),
             )
         except Exception as ex:  # pylint: disable=broad-except
             if pairing_removed(ex):
@@ -1481,7 +1528,7 @@ async def run_stream(args):
         f"Looking for {args.host or 'an Apple TV'}…", find(args.host)
     )
     address = str(conf.address)
-    atv, password = await login_paired(conf, storage, args)
+    atv, password = await login_paired(conf, storage, args, companion=False)
 
     if args.detach:  # the password is known to work now; hand over to a new process
         await asyncio.gather(*atv.close(), return_exceptions=True)
@@ -1603,7 +1650,7 @@ async def pair_protocols(conf, storage, args, *, again=False, verify=True, repor
     await storage.save()
 
 
-async def login_paired(conf, storage, args):
+async def login_paired(conf, storage, args, companion=True):
     """Connect, pairing first if that was never done or has been removed."""
     interactive = sys.stdin.isatty()
     password = args.password or stored_password()
@@ -1618,13 +1665,13 @@ async def login_paired(conf, storage, args):
             raise Failure(f"{conf.name} is not paired; run sofatui pair when ready")
 
     try:
-        return await login(conf, storage, password)
+        return await login(conf, storage, password, companion)
     except Failure as ex:
         if not (interactive and pairing_removed(ex)):
             raise
     print(f"{ACCENT}◆{RESET} {BOLD}{conf.name}{RESET} no longer accepts the stored pairing")
     await pair_protocols(conf, storage, args)
-    return await login(conf, storage, password)
+    return await login(conf, storage, password, companion)
 
 
 async def pair_protocol(conf, storage, protocol, args):
