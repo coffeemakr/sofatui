@@ -1,0 +1,30 @@
+name: Publish
+
+# Publishes to PyPI when a GitHub release is published. Uses trusted publishing, so
+# there is no API token: PyPI trusts this workflow in the "pypi" environment.
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sofatui/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: Check that the tag matches the package version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ ! -f "dist/sofatui-${version}.tar.gz" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match the built version: $(ls dist)"
+            exit 1
+          fi
+      - run: uv publish
