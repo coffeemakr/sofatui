@@ -8,8 +8,10 @@ file on the Apple TV.
 import argparse
 import asyncio
 import logging
+from importlib.metadata import version as package_version
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import signal
@@ -156,9 +158,11 @@ STATES = {
 COMMANDS = {
     "stream": ("<file>", "play a local file"),
     "stop": ("", "stop the stream"),
+    "info": ("", "device details"),
     "help": ("", "list commands"),
     "quit": ("", "leave the remote"),
 }
+HIDDEN_COMMANDS = {"nerd"}  # work, but are not listed or completed
 MEDIA_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mp3", ".m4a", ".aac", ".wav"}
 MAX_SUGGESTIONS = 6  # completion rows shown above the command prompt
 CURSOR = "\x1b[7m \x1b[27m"
@@ -255,6 +259,22 @@ class Remote(PushListener, PowerListener, DeviceListener):
         self.streaming = None  # name of the file streaming in the background
         self._tasks = set()  # running command tasks
         self._processes = []  # background streams started here, to reap them
+        self.conf = conf
+        self.view = "remote"  # or "info" / "nerd", the sheets opened by commands
+        self.scroll = 0  # first visible row of a sheet
+        self.stream_info = None  # state of the background stream, if any
+        self.stats = SimpleNamespace(
+            connected_at=time.monotonic(),
+            sent=0,
+            failed=0,
+            latency=0.0,  # seconds the last button took
+            latency_total=0.0,
+            updates=0,
+            updated_at=None,
+            frames=0,
+            written=0,  # bytes sent to the terminal
+            layout="",
+        )
         self._candidates = (None, [], "")  # input, completions, heading
         self._zones = []  # click actions of the frame being built
         self.hitboxes = []  # (row, first column, last column, action) on screen
@@ -266,6 +286,8 @@ class Remote(PushListener, PowerListener, DeviceListener):
         self.playing = playstatus
         self.playing_at = time.monotonic()
         self.app = self._app_name()
+        self.stats.updates += 1
+        self.stats.updated_at = self.playing_at
 
     def playstatus_error(self, updater, exception):
         self.status = (f"push updates failed: {exception}", BAD)
@@ -323,11 +345,30 @@ class Remote(PushListener, PowerListener, DeviceListener):
                 self.input_key(key)
             elif key == "/":
                 self.input = ""
+            elif self.view != "remote":
+                self.view_key(key)
             elif key in ("q", "Q", "\x03", "\x04"):
                 self.stop.set()
             elif key in KEYS:
                 self.press(KEYS[key])
         self.draw()
+
+    def view_key(self, key):
+        """Keys while a sheet is open: they scroll or close it, not press buttons."""
+        if key in ("\x1b", "\r", "\n"):
+            self.view = "remote"
+        elif key in ("q", "Q", "\x03", "\x04"):
+            self.stop.set()
+        else:
+            self.scroll += {
+                "\x1b[A": -1, "\x1bOA": -1, "\x1b[B": 1, "\x1bOB": 1,
+                "\x1b[5~": -5, "\x1b[6~": 5,
+            }.get(key, 0)  # fmt: skip
+
+    def show(self, view):
+        """Open a sheet, or go back to the remote if it is already open."""
+        self.view = "remote" if self.view == view else view
+        self.scroll = 0
 
     def interrupt(self):
         """Ctrl+C leaves the command prompt first, then the remote."""
@@ -338,9 +379,11 @@ class Remote(PushListener, PowerListener, DeviceListener):
             self.draw()
 
     def mouse(self, button, column, row):
-        if button in (64, 65):  # wheel steps through completions
+        if button in (64, 65):  # wheel steps through completions or scrolls a sheet
             if self.input is not None:
                 self.complete(1 if button == 65 else -1)
+            elif self.view != "remote":
+                self.scroll += 1 if button == 65 else -1
         elif button == 0:  # left click
             for line, first, last, (kind, target) in self.hitboxes:
                 if line == row and first <= column <= last:
@@ -374,11 +417,16 @@ class Remote(PushListener, PowerListener, DeviceListener):
     async def worker(self):
         while True:
             button = await self.queue.get()
+            started = time.monotonic()
             try:
                 await BUTTONS[button][2](self)
                 self.status = (f"sent {button}", ACCENT)
+                self.stats.sent += 1
+                self.stats.latency = time.monotonic() - started
+                self.stats.latency_total += self.stats.latency
             except Exception as ex:  # pylint: disable=broad-except
                 self.status = (f"{button} failed: {ex}", BAD)
+                self.stats.failed += 1
 
     # --- command prompt ---
 
@@ -462,7 +510,7 @@ class Remote(PushListener, PowerListener, DeviceListener):
         name, _, arg = text.strip().partition(" ")
         if not name:
             return
-        if name not in COMMANDS:
+        if name not in COMMANDS and name not in HIDDEN_COMMANDS:
             self.status = (f"unknown command /{name} (try /help)", WARN)
             return
         getattr(self, f"cmd_{name}")(arg.strip())
@@ -483,6 +531,12 @@ class Remote(PushListener, PowerListener, DeviceListener):
 
     def cmd_stop(self, arg):
         self._spawn(self._stop_stream())
+
+    def cmd_info(self, arg):
+        self.show("info")
+
+    def cmd_nerd(self, arg):
+        self.show("nerd")
 
     def cmd_help(self, arg):
         names = "  ".join(f"/{name} {usage}".strip() for name, (usage, _) in COMMANDS.items())
@@ -514,7 +568,7 @@ class Remote(PushListener, PowerListener, DeviceListener):
     async def watch_stream(self):
         """Follow the background stream, which may start or end outside this remote."""
         while True:
-            info = background.running(self.address)
+            info = self.stream_info = background.running(self.address)
             name = Path(info["file"]).name if info else None
             if self.streaming and not name:
                 self.status = (f"stream of {self.streaming} ended", MUTED)
@@ -762,15 +816,195 @@ class Remote(PushListener, PowerListener, DeviceListener):
             lines[1:] = [f"{MUTED}{clip(names, cols)}{RESET}", self._prompt(cols - 1)]
         return lines
 
+    def _feature(self, feature):
+        return self.atv.features.in_state(FeatureState.Available, feature)
+
+    def _stream_rows(self):
+        info = self.stream_info
+        if not info:
+            return [("Stream", "none")]
+        rows = [("Stream", Path(info["file"]).name)]
+        if "started" in info:
+            rows.append(("  running for", clock(time.time() - info["started"])))
+        return rows
+
+    def _info_rows(self):
+        """Rows of the /info sheet: (label, value), or (heading, None)."""
+        device, stats = self.atv.device_info, self.stats
+        system = {"TvOS": "tvOS", "MacOS": "macOS"}.get(
+            device.operating_system.name, device.operating_system.name
+        )
+        system = f"{system} {device.version or '?'}"
+        if self._feature(FeatureName.SetVolume):
+            volume = "yes, with level"
+        elif self._feature(FeatureName.VolumeUp):
+            volume = "yes, up and down only"
+        else:
+            volume = "not reported by the Apple TV"
+        power = self._power_on()
+        rows = [
+            ("Device", None),
+            ("Name", self.name),
+            ("Model", device.model_str),
+            ("System", system),
+            ("Address", self.address),
+            ("MAC", device.mac or "unknown"),
+            ("Status", None),
+            ("Power", "unknown" if power is None else "on" if power else "off"),
+            ("App", self.app or "none"),
+            ("Remote", "available" if self._feature(FeatureName.Select) else "no"),
+            ("Volume", volume),
+            ("Pairing", None),
+        ]
+        for service in self.conf.services:
+            if service.protocol == Protocol.RAOP:  # the audio side of AirPlay
+                continue
+            state = "paired" if service.credentials else "not paired"
+            if service.requires_password:
+                state += ", password protected"
+            rows.append((service.protocol.name, state))
+        rows += [
+            ("This session", None),
+            ("Connected", f"for {clock(time.monotonic() - stats.connected_at)}"),
+            ("Buttons sent", f"{stats.sent}" + (f" ({stats.failed} failed)" if stats.failed else "")),
+            *self._stream_rows(),
+        ]
+        return rows
+
+    def _nerd_rows(self):
+        """Rows of the hidden /nerd sheet: the same, for people who like numbers."""
+        device, stats, atv = self.atv.device_info, self.stats, self.atv
+        features = atv.features.all_features(include_unsupported=True).values()
+        available = sum(f.state == FeatureState.Available for f in features)
+        cols, lines = shutil.get_terminal_size()
+        updated = stats.updated_at
+        rows = [
+            ("Software", None),
+            ("sofatui", __version__),
+            ("pyatv", f"{package_version('pyatv')} (patched at startup)"),
+            ("python", f"{platform.python_version()} on {platform.system()}"),
+            ("pid", str(os.getpid())),
+            ("Device", None),
+            ("model id", device.raw_model or "?"),
+            ("build", device.build_number or "?"),
+            ("identifier", str(self.conf.identifier)),
+            ("output device", device.output_device_id or "?"),
+        ]
+        for service in self.conf.services:
+            properties = service.properties
+            rows.append((service.protocol.name.lower(), f"port {service.port}, pairing {service.pairing.name}"))
+            for key in ("srcvers", "features", "ft", "flags", "sf", "protovers", "rpFl"):
+                if key in properties:
+                    rows.append((f"  {key}", str(properties[key])))
+        rows += [
+            ("Connection", None),
+            ("remote via", getattr(atv.remote_control.main_protocol, "name", "none")),
+            ("metadata via", getattr(atv.metadata.main_protocol, "name", "none")),
+            ("audio via", getattr(atv.audio.main_protocol, "name", "none")),
+            ("features", f"{available} of {len(features)} available"),
+            ("uptime", f"{time.monotonic() - stats.connected_at:.0f} s"),
+            ("Events", None),
+            ("push updates", f"{stats.updates}"
+             + (f", last {time.monotonic() - updated:.0f} s ago" if updated else "")),
+            ("buttons", f"{stats.sent} sent, {stats.failed} failed"),
+            ("latency", f"last {stats.latency * 1000:.0f} ms, mean "
+             f"{stats.latency_total / stats.sent * 1000:.0f} ms" if stats.sent else "no button yet"),
+            ("Rendering", None),
+            ("terminal", f"{cols}x{lines}, {stats.layout} layout"),
+            ("frames", f"{stats.frames} drawn, {stats.written / 1024:.0f} kB written"),
+            ("click zones", str(len(self.hitboxes))),
+            ("Stream", None),
+        ]
+        info = self.stream_info
+        if info:
+            rows += [
+                ("file", info["file"]),
+                ("pid", str(info["pid"])),
+                ("log", str(background.log_file(self.address))),
+            ]
+            if "started" in info:
+                rows.append(("uptime", f"{time.time() - info['started']:.0f} s"))
+        else:
+            rows += [
+                ("state", "none"),
+                ("state file", str(background.state_file(self.address))),
+            ]
+        return rows
+
+    def _sheet(self, width, height, title, rows):
+        """A card listing label/value rows; scrolls when it does not fit."""
+        r = RESET
+        card = Card(width)
+        name = gradient(clip(self.name, width - 10))
+        card.row(f"{ACCENT}◆{r} {BOLD}{name}{r}", right=self._badge())
+        card.rule(title)
+
+        # Wrap long values onto following rows, so nothing is cut off
+        labels = min(16, max(len(label) for label, value in rows if value is not None) + 2)
+        space = width - labels
+        rows = [
+            (label if start == 0 else "", value and value[start : start + space])
+            for label, value in rows
+            for start in range(0, max(len(value or ""), 1), space)
+        ]
+
+        room = max(1, height - 6)  # borders, name, two rules and the status row
+        headings = [i for i, (_, value) in enumerate(rows) if value is None and i]
+        if len(rows) + len(headings) <= room:  # space out the sections if they fit
+            for i in reversed(headings):
+                rows.insert(i, ("", ""))
+        self.scroll = max(0, min(self.scroll, len(rows) - room))
+        for label, value in rows[self.scroll : self.scroll + room]:
+            if value is None:
+                card.row(f"{ACCENT}{BOLD}{label}{r}")
+            else:
+                card.row(f"{MUTED}{label.ljust(labels)}{r}{TEXT}{value}{r}")
+
+        hint = "esc: back to the remote"
+        if len(rows) > room:
+            last = min(self.scroll + room, len(rows))
+            hint += f" · ↑↓ {last}/{len(rows)}"
+        card.rule(hint)
+        self._status_row(card)
+        return card.close()
+
+    def _tiny_sheet(self, cols, height, rows):
+        """A sheet as bare lines, for terminals too small for a card."""
+        lines = [
+            f"{ACCENT}{BOLD}{clip(label, cols)}{RESET}"
+            if value is None
+            else f"{MUTED}{label} {TEXT}{clip(value, max(1, cols - len(label) - 1))}{RESET}"
+            for label, value in rows
+        ]
+        room = max(1, height - 1)
+        self.scroll = max(0, min(self.scroll, len(lines) - room))
+        hint = f"{MUTED}{clip('esc: back · ↑↓ scroll', cols)}{RESET}"
+        return [*lines[self.scroll : self.scroll + room], hint][-height:]
+
     def frame(self, cols, rows):
         """Pick the largest layout that fits the terminal."""
         width = min(WIDTH, cols - 4)
+        if self.view != "remote":
+            title, sheet_rows = (
+                ("info", self._info_rows())
+                if self.view == "info"
+                else ("stats for nerds", self._nerd_rows())
+            )
+            if rows >= 8 and width >= COMPACT_WIDTH:
+                lines = self._sheet(width, rows, title, sheet_rows)
+                return lines if self.input is None else self._overlay(lines, width)
+            if self.input is None:
+                return self._tiny_sheet(cols, rows, sheet_rows)
+
         if rows >= FULL_ROWS and width >= FULL_WIDTH:
+            self.stats.layout = "full"
             lines = self._full(width, spare=rows - FULL_ROWS)
         elif rows >= COMPACT_ROWS and width >= COMPACT_WIDTH:
+            self.stats.layout = "compact"
             lines = self._compact(width)
         else:
             # Keep the prompt visible when there is not even room for three lines
+            self.stats.layout = "tiny"
             lines = self._tiny(cols)
             return lines[:rows] if self.input is None else lines[-rows:]
         return lines if self.input is None else self._overlay(lines, width)
@@ -812,6 +1046,8 @@ class Remote(PushListener, PowerListener, DeviceListener):
             self._last_frame = output
             sys.stdout.write(output)
             sys.stdout.flush()
+            self.stats.frames += 1
+            self.stats.written += len(output.encode())
 
     # --- main loop ---
 
@@ -1064,7 +1300,13 @@ async def run_stream(args):
     try:
         await asyncio.to_thread(background.stop, address)  # one stream per device
         lock = background.claim(
-            address, {"pid": os.getpid(), "file": str(path.resolve()), "name": conf.name}
+            address,
+            {
+                "pid": os.getpid(),
+                "file": str(path.resolve()),
+                "name": conf.name,
+                "started": time.time(),
+            },
         )
         print(f"Streaming {path.name} to {conf.name}", flush=True)
         await atv.stream.play_url(str(path))

@@ -104,6 +104,7 @@ Shift+drag.
 |------------------|------------------------------------------------------|
 | `/stream <file>` | Play a local file on the Apple TV, in the background |
 | `/stop`          | Stop the background stream                           |
+| `/info`          | Show details about the Apple TV and this session     |
 | `/help`          | List the commands                                    |
 | `/quit`          | Leave sofatui                                        |
 
@@ -146,6 +147,17 @@ and uploads it to PyPI; it stops if the tag and the version differ.
   pinned for that reason, and the patches should go away once pyatv supports this
   itself.
 - **Tested on one device only:** an Apple TV 4K (3rd generation) on tvOS 27.
+
+## Thanks
+
+sofatui stands on the shoulders of [pyatv](https://pyatv.dev) by
+[@postlund](https://github.com/postlund) and its contributors. Discovery, pairing,
+the remote control protocol and AirPlay are all pyatv; sofatui is only the couch-side
+interface on top. If you want to talk to an Apple TV from Python, start there.
+
+Thanks also to [@jlacivita](https://github.com/jlacivita), whose pull request
+[pyatv#2846](https://github.com/postlund/pyatv/pull/2846) showed how current tvOS
+expects URL playback to be started.
 
 ## License
 
