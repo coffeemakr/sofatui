@@ -1,0 +1,40 @@
+[project]
+name = "sofatui"
+dynamic = ["version"]
+description = "A terminal remote control for the Apple TV that can also stream local files"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "pwinput>=1.0.3",
+    # Pinned: sofatui patches pyatv internals at startup, see pyatv_patches.py
+    "pyatv==0.18.0",
+]
+keywords = ["apple tv", "airplay", "remote", "tui", "pyatv"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Home Automation",
+]
+
+[project.urls]
+Repository = "https://github.com/coffeemakr/sofatui"
+
+[project.scripts]
+sofatui = "sofatui.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/sofatui/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sofatui"]
+
+[tool.uv]
+# Rebuild for "uvx --from ." when the sources change, not only this file
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
