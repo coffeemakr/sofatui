@@ -1,6 +1,6 @@
 [project]
 name = "sofatui"
-version = "0.1.0"
+version = "0.2.0"
 description = "A terminal remote control for the Apple TV that can also stream local files"
 readme = "README.md"
 license = "MIT"
